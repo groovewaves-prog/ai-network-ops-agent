@@ -18,16 +18,17 @@ else:
     # ローカル実行用など（必要なければ空文字やエラー処理へ）
     GOOGLE_API_KEY = "YOUR_LOCAL_KEY_OR_EMPTY"
 
-# Cisco DevNet Always-On Sandbox Connection Details
+# Cisco DevNet Always-On Sandbox (Nexus 9000)
+# IOS-XEより空いていることが多いです
 SANDBOX_DEVICE = {
-    'device_type': 'cisco_xe',
-    'host': 'sandbox-iosxe-recomm-1.cisco.com',
-    'username': 'developer',
-    'password': 'cisco12345',  # <--- ここを判明したパスワードに修正
+    'device_type': 'cisco_nxos',    # <--- デバイスタイプ変更
+    'host': 'sandbox-nxos-1.cisco.com',
+    'username': 'admin',            # <--- ユーザー名変更
+    'password': 'Admin_1234!',      # <--- パスワード変更
     'port': 22,
-    'global_delay_factor': 4,  # <--- 混雑しているので待機時間をさらに2倍(4)に増やす
-    'banner_timeout': 60,      # <--- バナー待ちも長くする
-    'conn_timeout': 60,        # <--- 接続タイムアウトも長くする
+    'global_delay_factor': 2,
+    'banner_timeout': 30,
+    'conn_timeout': 30,
 }
 
 # AI Model Configuration
