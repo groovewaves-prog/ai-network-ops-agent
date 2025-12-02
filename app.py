@@ -32,7 +32,7 @@ SANDBOX_DEVICE = {
 }
 
 # AI Model Configuration
-MODEL_NAME = 'gemini-1.5-flash' # 高速応答なFlashモデルを採用
+MODEL_NAME = 'gemini-2.0-flash' # 高速応答なFlashモデルを採用
 
 # ==========================================
 # 2. Functional Logic (Backend)
