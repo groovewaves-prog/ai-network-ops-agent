@@ -76,10 +76,10 @@ def connect_and_fetch() -> dict:
     実機にSSH接続し、コマンドを実行して結果を返します。
     """
     commands = [
-        "terminal length 0",            # ページネーション無効化（必須）
-        "show version | include Cisco IOS",
-        "show ip interface brief",
-        "show ip route summary",
+        "terminal length 0",
+        "show version",              # NX-OSは "| include Cisco IOS" が不要
+        "show interface brief",      # NX-OSは "ip" が付かないことが多い
+        "show ip route",             # NX-OSは "summary" が無い場合がある
     ]
     
     raw_output = ""
