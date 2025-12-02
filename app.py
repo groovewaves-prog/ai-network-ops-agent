@@ -20,15 +20,14 @@ else:
 
 # Cisco DevNet Always-On Sandbox Connection Details
 SANDBOX_DEVICE = {
-    'device_type': 'cisco_xe',      # iosxeに最適化
+    'device_type': 'cisco_xe',
     'host': 'sandbox-iosxe-recomm-1.cisco.com',
     'username': 'developer',
-    'password': 'C1sco12345',
+    'password': 'cisco12345',  # <--- ここを判明したパスワードに修正
     'port': 22,
-    # 公衆回線越しのSandbox接続は不安定なため、タイムアウトと待機時間を長めに設定
-    'global_delay_factor': 2,       # 通常の2倍待機する
-    'banner_timeout': 30,           # バナー表示待ち時間
-    'conn_timeout': 30,             # 接続タイムアウト
+    'global_delay_factor': 4,  # <--- 混雑しているので待機時間をさらに2倍(4)に増やす
+    'banner_timeout': 60,      # <--- バナー待ちも長くする
+    'conn_timeout': 60,        # <--- 接続タイムアウトも長くする
 }
 
 # AI Model Configuration
