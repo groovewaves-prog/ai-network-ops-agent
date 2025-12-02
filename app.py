@@ -1,225 +1,245 @@
 import streamlit as st
-import graphviz
-import os
 import google.generativeai as genai
+from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+import re
+import time
+import os
 
-from data import TOPOLOGY
-from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
-from network_ops import run_diagnostic_simulation
+# ==========================================
+# 1. Configuration & Constants
+# ==========================================
 
-st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
-
-# --- トポロジー描画 ---
-def render_topology(alarms, root_cause_node):
-    graph = graphviz.Digraph()
-    graph.attr(rankdir='TB')
-    graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
-    alarmed_ids = {a.device_id for a in alarms}
-    for node_id, node in TOPOLOGY.items():
-        color = "#e8f5e9"
-        penwidth = "1"
-        if root_cause_node and node_id == root_cause_node.id:
-            color = "#ffcdd2"
-            penwidth = "3"
-        elif node_id in alarmed_ids:
-            color = "#fff9c4"
-        graph.node(node_id, label=f"{node_id}\n({node.type})", fillcolor=color, color='black', penwidth=penwidth)
-    for node_id, node in TOPOLOGY.items():
-        if node.parent_id:
-            graph.edge(node.parent_id, node_id)
-            parent = TOPOLOGY.get(node.parent_id)
-            if parent and parent.redundancy_group:
-                partners = [n.id for n in TOPOLOGY.values() if n.redundancy_group == parent.redundancy_group and n.id != parent.id]
-                for p in partners: graph.edge(p, node_id)
-    return graph
-
-# --- Config読み込み ---
-def load_config_by_id(device_id):
-    path = f"configs/{device_id}.txt"
-    if os.path.exists(path):
-        try: with open(path, "r", encoding="utf-8") as f: return f.read()
-        except: return None
-    return None
-
-# --- UI構築 ---
-st.title("⚡ Antigravity AI Agent (Live Demo)")
-
-api_key = None
+# NOTE: 本番環境では st.secrets を使用して管理することを推奨します
+# ローカル実行用に、ここに直接キーを記述するか、st.secrets["GOOGLE_API_KEY"] を使用してください
 if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"]
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 else:
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    # ここにあなたのAPIキーを貼り付けてください
+    GOOGLE_API_KEY = "YOUR_GEMINI_API_KEY_HERE" 
 
-with st.sidebar:
-    st.header("⚡ 運用モード選択")
-    selected_scenario = st.radio(
-        "シナリオ:", 
-        ("正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害", "4. [Live] Cisco実機診断")
-    )
-    if not api_key:
-        st.warning("API Key Missing")
-        user_key = st.text_input("Google API Key", type="password")
-        if user_key: api_key = user_key
+# Cisco DevNet Always-On Sandbox Connection Details
+# 検証結果に基づき、混雑の少ないNX-OS(Nexus 9000)を採用
+SANDBOX_DEVICE = {
+    'device_type': 'cisco_nxos',    # Nexus OS設定
+    'host': 'sandbox-nxos-1.cisco.com',
+    'username': 'admin',
+    'password': 'Admin_1234!',      # NX-OS用パスワード
+    'port': 22,
+    # 公衆回線越しのSandbox接続用チューニング
+    'global_delay_factor': 2,       
+    'banner_timeout': 30,           
+    'conn_timeout': 30,             
+}
 
-if "current_scenario" not in st.session_state:
-    st.session_state.current_scenario = "正常稼働"
-    st.session_state.messages = []
-    st.session_state.chat_session = None 
-    st.session_state.live_result = None
-    st.session_state.trigger_analysis = False
+# AI Model Configuration
+# 最新の高速モデルを指定
+MODEL_NAME = 'gemini-2.0-flash'
 
-if st.session_state.current_scenario != selected_scenario:
-    st.session_state.current_scenario = selected_scenario
-    st.session_state.messages = []
-    st.session_state.chat_session = None
-    st.session_state.live_result = None
-    st.session_state.trigger_analysis = False
-    st.rerun()
+# ==========================================
+# 2. Functional Logic (Backend)
+# ==========================================
 
-# --- アラーム生成 ---
-alarms = []
-if selected_scenario == "1. WAN全回線断":
-    alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
-elif selected_scenario == "2. FW片系障害":
-    alarms = [Alarm("FW_01_PRIMARY", "Heartbeat Loss", "WARNING")]
-elif selected_scenario == "3. L2SWサイレント障害":
-    alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
+def configure_genai():
+    """Gemini APIの初期設定"""
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        return True
+    except Exception as e:
+        return str(e)
 
-root_cause = None
-reason = ""
-if alarms:
-    engine = CausalInferenceEngine(TOPOLOGY)
-    res = engine.analyze_alarms(alarms)
-    root_cause = res.root_cause_node
-    reason = res.root_cause_reason
-
-# --- 画面レイアウト ---
-col1, col2 = st.columns([1, 1])
-
-# 左カラム：トポロジー & 診断実行
-with col1:
-    st.subheader("Network Status")
-    st.graphviz_chart(render_topology(alarms, root_cause), use_container_width=True)
+def sanitize_output(text: str) -> str:
+    """
+    機密情報をマスク処理します。
+    プライベートIPは残し、グローバルIPのみを隠すロジックを実装しています。
+    """
+    rules = [
+        # 1. Passwords / Secrets / Community Strings
+        (r'(password|secret) \d+ \S+', r'\1 <HIDDEN_PASSWORD>'),
+        (r'(encrypted password) \S+', r'\1 <HIDDEN_PASSWORD>'),
+        (r'(snmp-server community) \S+', r'\1 <HIDDEN_COMMUNITY>'),
+        (r'(username \S+ privilege \d+ secret \d+) \S+', r'\1 <HIDDEN_SECRET>'),
+        
+        # 2. Public IP Masking
+        # 10.x, 172.16-31.x, 192.168.x (プライベートIP) 以外をマスク対象とする正規表現
+        (r'\b(?!(?:10|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.)\d{1,3}\.(?:\d{1,3}\.){2}\d{1,3}\b', '<MASKED_PUBLIC_IP>'),
+        
+        # 3. MAC Address
+        (r'([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}', '<MASKED_MAC>'),
+    ]
     
-    if root_cause:
-        st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
-        st.caption(f"理由: {reason}")
+    sanitized_text = text
+    for pattern, replacement in rules:
+        sanitized_text = re.sub(pattern, replacement, sanitized_text)
+        
+    return sanitized_text
+
+def connect_and_fetch() -> dict:
+    """
+    実機(NX-OS)にSSH接続し、コマンドを実行して結果を返します。
+    """
+    # NX-OS用にコマンドを調整
+    commands = [
+        "terminal length 0",            # ページネーション無効化
+        "show version",                 # システム情報
+        "show interface brief",         # インターフェース状態一覧
+        "show ip route",                # ルーティング情報
+    ]
     
-    is_live_mode = (selected_scenario == "4. [Live] Cisco実機診断")
+    raw_output = ""
     
-    if is_live_mode or root_cause:
+    try:
+        with ConnectHandler(**SANDBOX_DEVICE) as ssh:
+            # プロンプト取得
+            prompt = ssh.find_prompt()
+            raw_output += f"Connected to: {prompt}\n"
+
+            for cmd in commands:
+                # コマンド送信
+                output = ssh.send_command(cmd)
+                raw_output += f"\n{'='*30}\n[Command] {cmd}\n{output}\n"
+                # 連続実行エラー防止のため少し待機
+                time.sleep(0.5)
+
+        # 成功時: サニタイズ処理を実行
+        sanitized = sanitize_output(raw_output)
+        return {
+            "success": True, 
+            "raw": raw_output, 
+            "sanitized": sanitized
+        }
+            
+    except (NetmikoTimeoutException, NetmikoAuthenticationException) as e:
+        return {"success": False, "error": f"Network Error: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "error": f"System Error: {str(e)}"}
+
+def ask_gemini_agent(sanitized_log: str) -> str:
+    """
+    サニタイズされたログをGeminiに送信し、解析結果を取得します。
+    """
+    # APIキー未設定チェック
+    if "YOUR_GEMINI_API_KEY" in GOOGLE_API_KEY:
+        return "⚠️ エラー: ソースコード内の `GOOGLE_API_KEY` に正しいAPIキーを設定してください。"
+
+    prompt = f"""
+    あなたはデータセンターネットワークのスペシャリストAIです。
+    以下はCisco Nexus (NX-OS) スイッチから取得・サニタイズされたステータスログです。
+    これを分析し、以下のフォーマットでレポートを作成してください。
+
+    ### 🛡️ Nexus 自動診断レポート
+    **判定**: [ 正常 / 注意 / 異常 ] から選択
+    
+    **1. デバイス概要**
+    *   NX-OSバージョン、稼働時間(Uptime)、プラットフォーム(Chassis)を簡潔に。
+    
+    **2. インターフェース状態**
+    *   接続されている主要なインターフェース(Eth1/1など)のステータス(up/down)を確認。
+    *   VLANや管理ポート(mgmt0)の状態について言及。
+    
+    **3. ルーティング状況**
+    *   認識されているルート数や、デフォルトゲートウェイの有無。
+    
+    **4. 考察と推奨アクション**
+    *   ログから読み取れるネットワークの健全性と、もしあれば追加確認すべきコマンド。
+
+    --- Log Data Start ---
+    {sanitized_log}
+    --- Log Data End ---
+    """
+    
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"🤖 AI Agent Error: {str(e)}"
+
+# ==========================================
+# 3. UI / Workflow (Streamlit)
+# ==========================================
+
+def main():
+    st.set_page_config(page_title="AI NetOps Agent (NX-OS)", layout="wide", page_icon="🛡️")
+    
+    # Header
+    st.title("🛡️ Autonomous Network Operations Agent")
+    st.markdown("""
+    **Cisco NX-OS 自律診断モジュール**  
+    Nexus 9000 Sandbox (Data Center) に自律接続し、Gemini 2.0 Flash が診断を行います。
+    """)
+    
+    # API設定チェック
+    api_check = configure_genai()
+    if api_check is not True:
+        st.error(f"Gemini API Config Error: {api_check}")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("Agent Status")
+        st.success("● System Online")
+        st.info(f"Target: {SANDBOX_DEVICE['host']}\nOS: Cisco NX-OS\nModel: {MODEL_NAME}")
         st.markdown("---")
-        st.info("🛠 **自律調査エージェント**")
-        
-        if st.button("🚀 診断実行 (Auto-Diagnostic)", type="primary"):
-            if not api_key:
-                st.error("API Key Required")
-            else:
-                with st.status("Agent Operating...", expanded=True) as status:
-                    st.write("🔌 Establishing Connection...")
-                    res = run_diagnostic_simulation(selected_scenario)
-                    st.session_state.live_result = res
-                    
-                    if res["status"] == "SUCCESS":
-                        st.write("✅ Data Acquired.")
-                        st.write("🧹 Sanitizing Sensitive Information...")
-                        status.update(label="Complete!", state="complete", expanded=False)
-                    else:
-                        st.write("❌ Connection Failed.")
-                        status.update(label="Target Unreachable", state="error", expanded=False)
-                    
-                    st.session_state.trigger_analysis = True
-                    st.rerun()
+        st.caption("Disclaimer: Connecting to Cisco DevNet Always-On Sandbox.")
 
-        # 診断結果表示（タブ形式に変更）
-        if st.session_state.live_result:
-            res = st.session_state.live_result
-            if res["status"] == "SUCCESS":
-                st.success("🛡️ **Data Sanitized**: 機密情報はマスク処理済み")
+    # Main Layout
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("📡 Operation Console")
+        st.write("ボタンを押すと、エージェントがバックグラウンドで診断ワークフローを開始します。")
+        
+        execute_btn = st.button("🚀 自動診断を実行 (Start Diagnostics)", type="primary")
+        
+        if execute_btn:
+            # ステータス表示コンテナ
+            with st.status("Agent Workflow Running...", expanded=True) as status:
                 
-                # タブで生ログ（サニタイズ済）を見やすく表示
-                tab_log, tab_raw = st.tabs(["🔒 Sanitized Log", "🔍 Raw (Debug)"])
-                with tab_log:
-                    st.code(res["sanitized_log"], language="text")
-                with tab_raw:
-                    st.warning("管理権限が必要です")
-            else:
-                st.error(f"診断結果: {res['error']}")
+                # Step 1: Network Connection
+                st.write("🔌 Establishing SSH Connection to Nexus Sandbox...")
+                result = connect_and_fetch()
+                
+                if not result["success"]:
+                    status.update(label="Connection Failed", state="error")
+                    st.error(result['error'])
+                    # エラー詳細の表示（トラブルシュート用）
+                    st.json(SANDBOX_DEVICE)
+                    return # 処理中断
 
-# 右カラム：AIチャット
-with col2:
-    st.subheader("AI Analyst Report")
-    if not api_key: st.stop()
+                st.write("✅ Data Acquired.")
+                st.write("🧹 Sanitizing Sensitive Information...")
+                
+                # Step 2: AI Analysis
+                st.write(f"🧠 Requesting AI Analysis ({MODEL_NAME})...")
+                ai_response = ask_gemini_agent(result["sanitized"])
+                
+                status.update(label="All Tasks Completed!", state="complete", expanded=False)
+                
+                # 結果をセッションステートに保存（再描画対策）
+                st.session_state['diag_result'] = result
+                st.session_state['ai_response'] = ai_response
 
-    # 初期化
-    should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
-    if should_start_chat:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.0})
+    # 結果表示エリア（セッションステートがあれば表示）
+    if 'diag_result' in st.session_state:
+        result = st.session_state['diag_result']
+        ai_response = st.session_state['ai_response']
         
-        system_prompt = ""
-        if st.session_state.live_result:
-            # Liveモードの初期化（再起動時など）
-            live_data = st.session_state.live_result
-            log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
-            system_prompt = f"診断結果に基づきレポートを作成せよ。\nステータス: {live_data['status']}\nログ: {log_content}"
-        elif root_cause:
-            conf = load_config_by_id(root_cause.id)
-            system_prompt = f"障害報告: {root_cause.id}。理由: {reason}。"
-            if conf: system_prompt += f"\nConfig:\n{conf}"
-        
-        if system_prompt:
-            chat = model.start_chat(history=[{"role": "user", "parts": [system_prompt]}])
-            try:
-                with st.spinner("Analyzing..."):
-                    res = chat.send_message("状況報告をお願いします。")
-                    st.session_state.chat_session = chat
-                    st.session_state.messages.append({"role": "assistant", "content": res.text})
-            except Exception as e: st.error(str(e))
+        with col2:
+            st.subheader("📋 Agent Report")
+            
+            # タブで表示切り替え
+            tab1, tab2, tab3 = st.tabs(["🤖 AI Analysis", "🔒 Sanitized Log", "🔍 Raw Log (Debug)"])
+            
+            with tab1:
+                st.markdown(ai_response)
+                
+            with tab2:
+                st.caption("AIに送信されたデータ（機密情報マスク済み）")
+                st.code(result["sanitized"], language="text")
+                
+            with tab3:
+                st.warning("注意: ここには生データが表示されます（管理者用）")
+                with st.expander("生ログを表示"):
+                    st.code(result["raw"], language="text")
 
-    # 診断後の追加分析 (トリガー)
-    if st.session_state.trigger_analysis and st.session_state.chat_session:
-        live_data = st.session_state.live_result
-        log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
-        
-        prompt = f"""
-        診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
-        
-        【診断データ】
-        ステータス: {live_data['status']}
-        ログ: {log_content}
-        
-        【出力要件】
-        1. 接続結果 (成功/失敗)
-        2. ログ分析 (インターフェース状態、ルート情報など)
-        3. 推奨アクション
-        """
-        st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
-        
-        with st.spinner("Analyzing Diagnostic Data..."):
-            try:
-                res = st.session_state.chat_session.send_message(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": res.text})
-            except Exception as e: st.error(str(e))
-        
-        st.session_state.trigger_analysis = False
-        st.rerun()
-
-    # チャットUI
-    chat_container = st.container(height=600)
-    with chat_container:
-        for msg in st.session_state.messages:
-            if "診断結果に基づき" in msg["content"]: continue
-            with st.chat_message(msg["role"]): st.markdown(msg["content"])
-
-    if prompt := st.chat_input("質問..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with chat_container:
-            with st.chat_message("user"): st.markdown(prompt)
-        if st.session_state.chat_session:
-            with chat_container:
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        res = st.session_state.chat_session.send_message(prompt)
-                        st.markdown(res.text)
-                        st.session_state.messages.append({"role": "assistant", "content": res.text})
+if __name__ == "__main__":
+    main()
