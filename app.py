@@ -21,7 +21,7 @@ else:
 # Cisco DevNet Always-On Sandbox Connection Details
 SANDBOX_DEVICE = {
     'device_type': 'cisco_xe',      # iosxeに最適化
-    'host': 'sandbox-iosxe-latest-1.cisco.com',
+    'host': 'sandbox-iosxe-recomm-1.cisco.com',
     'username': 'developer',
     'password': 'C1sco12345',
     'port': 22,
